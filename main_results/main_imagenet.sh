@@ -22,3 +22,14 @@ python main.py --method vlm --model_id Salesforce/instructblip-vicuna-13b --data
 
 python main.py --method clip --model_id ViT-L/14@336px --data_path ../data/imagenet.jsonl --class_path ../data/imagenet_classes.json --split valid --output_path outputs/imagenet_clipvitl336_1000classes.jsonl --including_label False --batch_size 32
 python main.py --method clip --model_id EVA01-CLIP-g-14-plus --data_path ../data/imagenet.jsonl --class_path ../data/imagenet_classes.json --split valid --output_path outputs/imagenet_evaclipg_1000classes.jsonl --including_label False --batch_size 32
+
+# Test corruption (0424)
+python main.py --method vlm --model_id llava-hf/llava-1.5-7b-hf --data_path ../data/imagenet_c_gaussian_noise.jsonl --class_path ../data/imagenet_classes.json --split valid --output_path outputs/imagenet_c/llava7b_gaussian_noise.jsonl --including_label False --batch_size 8
+python main.py --method vlm --model_id llava-hf/llava-1.5-7b-hf --data_path ../data/imagenet.jsonl --class_path ../data/imagenet_classes.json --split valid --output_path outputs/imagenet_c/llava7b_original.jsonl --including_label False --batch_size 8
+
+# Test corruption - closed set (0425)
+python main.py --method vlm --model_id llava-hf/llava-1.5-7b-hf --data_path ../data/imagenet_c_gaussian_noise.jsonl --class_path ../data/imagenet_classes.json --split valid --output_path outputs/imagenet_c/llava7b_gaussian_noise_closed_set.jsonl --including_label True --n_labels 50 --batch_size 8
+python main.py --method vlm --model_id llava-hf/llava-1.5-7b-hf --data_path ../data/imagenet.jsonl --class_path ../data/imagenet_classes.json --split valid --output_path outputs/imagenet_c/llava7b_original_closed_set.jsonl --including_label True --n_labels 50 --batch_size 8
+
+# diffusion 0428
+python main.py --method vlm --model_id llava-hf/llava-1.5-7b-hf --data_path ../data/imagenet_c_gaussian_noise_post_diffusion_filtered.jsonl --class_path ../data/imagenet_classes.json --split valid --output_path outputs/imagenet_c/llava7b_gaussian_noise_closed_set_post_diffusion.jsonl --including_label True --n_labels 50 --batch_size 16
