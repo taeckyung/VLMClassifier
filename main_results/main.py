@@ -7,6 +7,8 @@ from transformers import (
     Blip2ForConditionalGeneration,
     InstructBlipProcessor,
     InstructBlipForConditionalGeneration,
+    LlavaOnevisionProcessor,
+    LlavaOnevisionForConditionalGeneration,
 )
 import torch
 import torch.nn.functional as F
@@ -19,6 +21,7 @@ import clip
 from torchvision import transforms
 from torchvision.models import vit_b_16
 import os
+import numpy as np
 
 # Comment out only if using the EVA-CLIP model
 ########################################################################################
@@ -57,6 +60,11 @@ def main(
         model = InstructBlipForConditionalGeneration.from_pretrained(
             model_id, device_map="auto", torch_dtype=torch.bfloat16
         )
+    elif "llava-onevision" in model_id:
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+            model_id, device_map="cuda", torch_dtype=torch.bfloat16
+        )
     else:
         processor = AutoProcessor.from_pretrained(model_id)
         model = LlavaForConditionalGeneration.from_pretrained(
@@ -84,6 +92,7 @@ def main(
         for i in trange(0, len(data), batch_size):
             batch = data[i : i + batch_size]
             images = [Image.open(item["image"]) for item in batch]
+            image_paths = [item["image"] for item in batch] # for llava-onevision
 
             if including_label:
                 choices = []
@@ -93,6 +102,8 @@ def main(
                         choices.append(classes)
                     else:
                         label = item["label"]
+                        sample_seed = hash(f"{seed}_{item['image']}") % (2**32)
+                        random.seed(sample_seed)  # Set seed specific to this sample
                         other_choices = random.sample(
                             sorted(list(set(classes) - set([label]))), n_labels - 1
                         )
@@ -104,6 +115,10 @@ def main(
                     f"{init_prompt} Choose one from \"{', '.join(choice)}\"."
                     for choice in choices
                 ]
+                #questions = [
+                #    f"{init_prompt} ### Question\n*Question*: Given an image, what is the most likely answer among [{', '.join(choice)}]?\n\n*Answer*:"
+                #    for choice in choices
+                #]
             else:
                 questions = [init_prompt for _ in batch]
 
@@ -128,6 +143,29 @@ def main(
                         f"Question: {question} Let's think step by step. Answer:"
                         for question in questions
                     ]
+            elif "llava-onevision" in model_id:
+                assert not chain_of_thought # disregard cot for now
+
+                conversations = []
+                for question, image_path in zip(questions, image_paths):
+                    conv = [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "path": image_path},
+                            {"type": "text", "text": question}
+                        ],
+                    }]
+                    conversations.append(conv)
+
+                processor.tokenizer.padding_side = "left" # need for proper inference
+                inputs = processor.apply_chat_template(
+                    conversations,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    padding=True,
+                    return_dict=True,
+                    return_tensors="pt"
+                ).to("cuda")
             else:
                 if not chain_of_thought:
                     prompts = [
@@ -139,9 +177,11 @@ def main(
                         f"USER: <image>\n{question}\nASSISTANT: Let's think step by step."
                         for question in questions
                     ]
-            inputs = processor(
-                text=prompts, images=images, padding=True, return_tensors="pt"
-            ).to("cuda")
+            if not "llava-onevision" in model_id:
+                inputs = processor(
+                    text=prompts, images=images, padding=True, return_tensors="pt"
+                ).to("cuda")
+            
             output = model.generate(
                 **inputs, max_new_tokens=64 if not chain_of_thought else 512
             )
@@ -152,6 +192,8 @@ def main(
                     item["pred"] = text.split("[/INST]")[-1].strip()
                 elif "blip" in model_id:
                     item["pred"] = text.split("Answer:")[-1].strip()
+                elif "llava-onevision" in model_id:
+                    item["pred"] = text.split("assistant")[-1].strip()
                 else:
                     item["pred"] = text.split("ASSISTANT:")[-1].strip()
                 f.write(json.dumps(item) + "\n")
@@ -208,6 +250,8 @@ def main_clip(
                 choices = []
                 for item in batch:
                     label = item["label"]
+                    sample_seed = hash(f"{seed}_{item['image']}") % (2**32)
+                    random.seed(sample_seed)  # Set seed specific to this sample
                     other_choices = random.sample(
                         sorted(list(set(classes) - set([label]))), n_labels - 1
                     )
@@ -297,6 +341,8 @@ def main_supervised(
 
                 if including_label:
                     label = item["label"]
+                    sample_seed = hash(f"{seed}_{item['image']}") % (2**32)
+                    random.seed(sample_seed)  # Set seed specific to this sample
                     other_choices = random.sample(
                         sorted(list(set(classes) - set([label]))), n_labels - 1
                     )
