@@ -30,6 +30,65 @@ import numpy as np
 # from eva_clip import create_model_and_transforms, get_tokenizer
 ########################################################################################
 
+# === TDA Parameters & State ===
+TDA_CFG = {
+    "cap_pos": 3, "cap_neg": 2,
+    "alpha_pos": 2.0, "beta_pos": 5.0,
+    "alpha_neg": 2, "beta_neg": 5.0,
+    "tau_low": 0.2, "tau_high": 0.5,
+    "pl": 0.03,
+}
+tda_positive_cache = {}  # {class_idx: [(feature, entropy)]}
+tda_negative_cache = {}  # {class_idx: [(feature, entropy, neg_mask)]}
+
+def tda_entropy(logits):
+    probs = F.softmax(logits, dim=-1)
+    return -(probs * torch.log(probs + 1e-6)).sum(dim=-1)
+
+def update_tda_cache(cache, class_idx, feature, entropy, cap, extra=None):
+    if class_idx not in cache:
+        cache[class_idx] = []
+    entry = (feature, entropy) if extra is None else (feature, entropy, extra)
+    if len(cache[class_idx]) < cap:
+        cache[class_idx].append(entry)
+    else:
+        worst = max(cache[class_idx], key=lambda x: x[1])
+        if entropy < worst[1]:
+            cache[class_idx].remove(worst)
+            cache[class_idx].append(entry)
+    cache[class_idx].sort(key=lambda x: x[1])
+
+def compute_tda_logits(query, cache, alpha, beta, num_classes, is_negative=False):
+    if not cache:
+        return torch.zeros((1, num_classes), device=query.device)
+    keys, vals = [], []
+    for cls, items in cache.items():
+        for item in items:
+            keys.append(item[0].float())
+            if is_negative:
+                vals.append(item[2].float())
+            else:
+                v = torch.zeros(num_classes, device=query.device)
+                v[cls] = 1.0
+                vals.append(v)
+    K = torch.stack(keys).T  # (D, N)
+    V = torch.stack(vals)    # (N, C)
+    query = query.float()    # (1, D)
+    affinity = query @ K     # (1, N)
+    weights = alpha * torch.exp(-beta * (1 - affinity))
+    return weights @ V       # (1, C)
+
+@torch.no_grad()
+def extract_image_features(model, processor, pixel_values):
+    with torch.no_grad():
+        vision_outputs = model.vision_tower(pixel_values)
+        image_features = F.normalize(vision_outputs.last_hidden_state.mean(dim=1), dim=-1)
+
+        # Step 2: Project to language space
+        projected_feats = model.multi_modal_projector(image_features)  # [B, 4096]
+    return projected_feats
+
+
 
 def main(
     model_id,
@@ -87,6 +146,14 @@ def main(
 
     if init_prompt is None:
         init_prompt = "What type of object is in this photo?"
+
+    # === Precompute W_c ===
+    # Generate class text embeddings
+    prompts = [f"A photo of a {c}" for c in classes]
+    input_ids = processor.tokenizer(prompts, return_tensors="pt", padding=True).input_ids.to("cuda")
+    with torch.no_grad():
+        text_embed = model.language_model.model.embed_tokens(input_ids).mean(dim=1)  # [N, D]
+        W_c = F.normalize(text_embed, dim=-1)
 
     with open(output_path, "a") as f:
         for i in trange(0, len(data), batch_size):
@@ -186,7 +253,38 @@ def main(
                 **inputs, max_new_tokens=64 if not chain_of_thought else 512
             )
             generated_text = processor.batch_decode(output, skip_special_tokens=True)
-            for item, text in zip(batch, generated_text):
+
+            # TDA start
+            pixel_values = inputs["pixel_values"]
+            image_features = extract_image_features(model, processor, pixel_values)  # (B, D)
+            logits = image_features @ W_c.T  # (B, C)
+            probs = F.softmax(logits, dim=-1)
+            entropy_vals = tda_entropy(logits)
+            final_logits = logits.clone()
+
+            # print(image_features.shape, W_c.T.shape, probs.shape)
+            # exit(0)
+
+            clip_style_preds, tda_preds = [], []
+            for j, (feat, prob, ent) in enumerate(zip(image_features, probs, entropy_vals)):
+                cls_idx = prob.argmax().item()
+                clip_style_preds.append(classes[cls_idx])
+
+                update_tda_cache(tda_positive_cache, cls_idx, feat, ent.item(), TDA_CFG["cap_pos"])
+
+                if TDA_CFG["tau_low"] < ent < TDA_CFG["tau_high"]:
+                    neg_mask = (prob < TDA_CFG["pl"]).float() * -1
+                    update_tda_cache(tda_negative_cache, cls_idx, feat, ent.item(), TDA_CFG["cap_neg"], neg_mask)
+
+                pos_logit = compute_tda_logits(feat.unsqueeze(0), tda_positive_cache, TDA_CFG["alpha_pos"], TDA_CFG["beta_pos"], len(classes))
+                neg_logit = compute_tda_logits(feat.unsqueeze(0), tda_negative_cache, TDA_CFG["alpha_neg"], TDA_CFG["beta_neg"], len(classes), is_negative=True)
+
+                final_logits[j] += pos_logit[0] - neg_logit[0]
+
+                tda_preds.append(classes[final_logits[j].argmax().item()])
+            # TDA end
+
+            for item, text, clip_style_pred, tda_pred in zip(batch, generated_text, clip_style_preds, tda_preds):
                 item["output"] = text
                 if "mistral" in model_id:
                     item["pred"] = text.split("[/INST]")[-1].strip()
@@ -196,6 +294,8 @@ def main(
                     item["pred"] = text.split("assistant")[-1].strip()
                 else:
                     item["pred"] = text.split("ASSISTANT:")[-1].strip()
+                item["pred_clip_style"] = clip_style_pred
+                item["pred_tda"] = tda_pred
                 f.write(json.dumps(item) + "\n")
                 f.flush()
 
